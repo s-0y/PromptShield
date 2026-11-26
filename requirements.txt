@@ -1,1 +1,1 @@
-# Week 1 uses only the Python standard library (Python >= 3.10).
+# Python >= 3.11. API client, runners and tests use only the standard library.
