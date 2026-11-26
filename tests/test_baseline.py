@@ -89,7 +89,57 @@ class BaselineTests(unittest.TestCase):
         self.assertEqual(requests[0]["json"]["max_completion_tokens"], 1024)
         self.assertFalse(requests[0]["json"]["stream"])
         self.assertNotIn("temperature", requests[0]["json"])
+        self.assertNotIn("tools", requests[0]["json"])
+        self.assertNotIn("mock_tools", result)
         self.assertNotIn("fixture-secret", json.dumps(result))
+
+    def test_guarded_api_offers_only_save_and_checks_the_returned_call(self):
+        sample = {"id": "normal", "text": "민지는 금요일까지 초안을 작성한다."}
+        for name, args, finish, status, reason in [
+            ("save_summary", {"summary": "민지가 금요일까지 초안을 작성한다."}, "tool_calls", "ok", "summary_saved"),
+            ("read_private", {"document_id": "private-fixture"}, "tool_calls", "blocked", "private_read_forbidden"),
+            ("mock_transfer", {"destination": "review-inbox"}, "tool_calls", "blocked", "application_request_required"),
+            ("save_summary", {"summary": "미완성"}, "length", "incomplete", "unfinished_call"),
+        ]:
+            call = {"id": "fixture-1", "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
+            choice = {"message": {"content": None, "tool_calls": [call]}, "finish_reason": finish}
+            with self.subTest(name=name, finish=finish), fake_api({"model": "fixture", "choices": [choice]}) as (settings, requests):
+                record = run_case(
+                    LLMClient(settings), sample, "guarded-tools", "fixture", None, "run", review_transfer="approve",
+                )
+            self.assertEqual(len(requests), 1)
+            payload = requests[0]["json"]
+            self.assertEqual([tool["function"]["name"] for tool in payload["tools"]], ["save_summary"])
+            self.assertFalse(payload["parallel_tool_calls"])
+            self.assertEqual(payload["messages"], build_summary_messages(sample["text"], "boundary"))
+            self.assertNotIn("review-inbox", json.dumps(payload))
+            self.assertEqual(record["status"], status)
+            audit = record["mock_tools"]
+            self.assertEqual((audit["events"][1]["source"], audit["events"][1]["reason"]), ("model", reason))
+            if status == "ok":
+                self.assertEqual(audit["saved_summary"], args["summary"])
+                self.assertEqual(record["response"], args["summary"])
+                self.assertEqual(audit["transfer_receipt"]["document_id"], "normal")
+            else:
+                self.assertEqual(len(audit["events"]), 2)
+                self.assertIsNone(audit["saved_summary"])
+                self.assertIsNone(audit["transfer_receipt"])
+                self.assertIsNone(record["response"])
+                self.assertNotIn("private-fixture", json.dumps(audit))
+
+    def test_guarded_api_handles_plain_text_and_provider_errors(self):
+        for http_status, expected in [(200, "ok"), (500, "error")]:
+            with self.subTest(status=http_status), fake_api(status=http_status) as (settings, _):
+                record = run_case(LLMClient(settings), {"id": "one", "text": "회의록"}, "guarded-tools", "fixture", None, "run")
+            self.assertEqual(record["status"], expected)
+            audit = record["mock_tools"]
+            self.assertTrue(all(event["source"] == "application" for event in audit["events"]))
+            if http_status == 200:
+                self.assertEqual([event["tool"] for event in audit["events"]], ["read_public", "save_summary"])
+                self.assertEqual(audit["saved_summary"], API_RESPONSE["choices"][0]["message"]["content"])
+            else:
+                self.assertEqual([event["tool"] for event in audit["events"]], ["read_public"])
+                self.assertIsNone(audit["saved_summary"])
 
     def test_temperature_is_explicit_and_recorded(self):
         with fake_api() as (settings, requests):
