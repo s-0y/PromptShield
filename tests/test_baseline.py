@@ -141,6 +141,19 @@ class BaselineTests(unittest.TestCase):
                 self.assertEqual([event["tool"] for event in audit["events"]], ["read_public"])
                 self.assertIsNone(audit["saved_summary"])
 
+    def test_screening_calls_the_local_api_only_for_proceed_and_warn(self):
+        controls = load_records(ROOT / "data/benign_security.jsonl")
+        held = load_records(ROOT / "data/attacks.jsonl")[0]
+        samples = [controls[0], held, controls[-1]]
+        with fake_api() as (settings, requests):
+            client = LLMClient(settings)
+            records = [run_case(client, sample, "screened", "fixture", None, "run") for sample in samples]
+        self.assertEqual([r["input_risk"]["decision"] for r in records], ["proceed", "hold", "warn"])
+        self.assertEqual([r["status"] for r in records], ["ok", "held", "ok"])
+        self.assertEqual([request["json"]["messages"] for request in requests], [
+            build_summary_messages(sample["text"], "boundary") for sample in (controls[0], controls[-1])
+        ])
+
     def test_temperature_is_explicit_and_recorded(self):
         with fake_api() as (settings, requests):
             LLMClient(replace(settings, temperature=0.2)).complete(build_summary_messages("회의록"))

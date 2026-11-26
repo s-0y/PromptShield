@@ -1,4 +1,4 @@
-"""Run benign and attack samples in separate, stateless model requests."""
+"""Evaluate labeled samples independently and persist each screening or model result."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from pathlib import Path
 
 from agent.config import Settings, load_env
 from agent.datasets import load_records
+from agent.input_risk import RULESET_VERSION
 from agent.llm_client import LLMClient
 from agent.summarizer import add_common_arguments, new_run_id, run_case
 
@@ -29,18 +30,37 @@ def main() -> None:
         directory = args.output_dir / run_id
         directory.mkdir(parents=True, exist_ok=False)
         counts = {"ok": 0, "error": 0, "incomplete": 0}
+        screened = args.mode == "screened"
+        if screened:
+            counts["held"] = 0
+            decisions = {label: {"proceed": 0, "warn": 0, "hold": 0} for label in ("benign", "attack")}
+            model_calls = 0
         with (directory / "results.jsonl").open("w", encoding="utf-8") as stream:
             for sample, path, label in cases:
                 result = run_case(client, sample, args.mode, str(path), label, run_id)
                 stream.write(json.dumps(result, ensure_ascii=False) + "\n")
                 stream.flush()
                 counts[result["status"]] += 1
+                if screened:
+                    decisions[label][result["input_risk"]["decision"]] += 1
+                    model_calls += int(result["model_called"])
         summary = {
             "run_id": run_id, "total": len(cases), "counts": counts,
             "is_mock": client.settings.provider == "mock",
-            "prompt_mode": args.mode, "configuration": client.settings.public_metadata(),
+            "prompt_mode": "boundary" if screened else args.mode, "configuration": client.settings.public_metadata(),
             "grading": "not_performed", "results_file": str(directory / "results.jsonl"),
         }
+        if screened:
+            benign = decisions["benign"]
+            attack = decisions["attack"]
+            # Both labeled files were validated as nonempty before the first case.
+            summary["workflow"] = "screened"
+            summary["input_screening"] = {
+                "ruleset_version": RULESET_VERSION, "by_label": decisions, "model_calls": model_calls,
+                "benign_warning_rate": benign["warn"] / sum(benign.values()),
+                "benign_hold_rate": benign["hold"] / sum(benign.values()),
+                "attack_flag_rate": (attack["warn"] + attack["hold"]) / sum(attack.values()),
+            }
         (directory / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     except (OSError, ValueError) as exc:
         parser.error(str(exc))

@@ -12,6 +12,7 @@ import uuid
 
 from agent.config import Settings, load_env
 from agent.datasets import select_record
+from agent.input_risk import assess_input
 from agent.llm_client import Completion, LLMClient, LLMError, build_summary_messages
 from agent.tools import REVIEW_INBOX, MockToolSession
 
@@ -47,15 +48,17 @@ def run_case(
         raise ValueError("review transfer requires guarded-tools mode and request or approve")
     session = None
     document = sample["text"]
-    prompt_mode = mode
+    prompt_mode = "boundary" if mode in {"screened", "guarded-tools"} else mode
     if mode == "guarded-tools":
         session = MockToolSession(sample["id"], document, approve_transfer=review_transfer == "approve")
         read = session.application_call("read_public", {"document_id": sample["id"]})
         if not read.executed or read.value is None:
             raise ValueError(f"Selected document could not be read: {read.reason}")
         document = read.value
-        prompt_mode = "boundary"
-    messages = build_summary_messages(document, prompt_mode)
+    screening_started = time.perf_counter()
+    assessment = assess_input(document) if mode == "screened" else None
+    held = assessment is not None and assessment["decision"] == "hold"
+    messages = [] if held else build_summary_messages(document, prompt_mode)
     record = {
         "schema_version": 2 if session else 1,
         "run_id": run_id,
@@ -79,7 +82,14 @@ def run_case(
         "attack_success": None,
         "normal_task_success": None,
     }
-    started = time.perf_counter()
+    started = screening_started if assessment is not None else time.perf_counter()
+    if assessment is not None:
+        record.update(schema_version=3, workflow="screened", input_risk=assessment, model_called=False)
+        if held:
+            record["status"] = "held"
+            record["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 3)
+            return record
+        record["model_called"] = True
     try:
         if session is None:
             completion = client.complete(messages)
@@ -106,7 +116,9 @@ def run_case(
 
 def add_common_arguments(parser: argparse.ArgumentParser, *, single_case: bool = False) -> None:
     parser.add_argument("--provider", choices=("mock", "api"), help="Override local provider setting")
-    modes = ("baseline", "boundary", "guarded-tools") if single_case else ("baseline", "boundary")
+    modes = ("baseline", "boundary", "screened")
+    if single_case:
+        modes += ("guarded-tools",)
     parser.add_argument("--mode", choices=modes, default="baseline")
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--output-dir", type=Path, default=Path("results"))
@@ -141,11 +153,14 @@ def main() -> None:
         parser.error(str(exc))
     output = {key: result[key] for key in ("status", "is_mock", "response", "error")}
     output["result_file"] = str(path)
+    if "input_risk" in result:
+        output["input_risk"] = result["input_risk"]
+        output["model_called"] = result["model_called"]
     if "mock_tools" in result:
         output["tool_events"] = result["mock_tools"]["events"]
         output["transfer_receipt"] = result["mock_tools"]["transfer_receipt"]
     print(json.dumps(output, ensure_ascii=False, indent=2))
-    if result["status"] != "ok":
+    if result["status"] not in {"ok", "held"}:
         raise SystemExit(1)
 
 
